@@ -19,6 +19,8 @@ import {
   Wallet,
   AlertCircle,
   Upload,
+  ArrowRight,
+  LogIn,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -64,6 +66,10 @@ const CONDITIONS = [
   "Excluding",
   "TDS Including VDS Excluding",
   "N/A",
+];
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
 ];
 
 const emptyForm = {
@@ -169,6 +175,13 @@ function monthKey(d) {
     ... AD Remarks). Rows are detected by having a vendor name AND an
     invoice amount — header/blank rows are skipped automatically.
 --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   EXCEL IMPORT — reads a workbook and maps columns by their HEADER TEXT
+   first (so it works with the real Work sheet's headers — "Name of
+   Vendor", "TDS VDS Condition ", "TDS Rate", etc. — AND with files this
+   app itself exports later), falling back to the original Work-sheet
+   column positions only if no header row can be confidently detected.
+--------------------------------------------------------------------- */
 function excelDateToStr(v) {
   if (v instanceof Date && !isNaN(v)) {
     const y = v.getFullYear(),
@@ -179,6 +192,90 @@ function excelDateToStr(v) {
   if (typeof v === "string" && v.trim()) return v.trim();
   return "";
 }
+
+// TDS/VDS rates can come out of Excel as a true fraction (0.075), a bare
+// percent number (7.5), or text ("7.5%"). All three should mean 7.5%.
+function normalizeRate(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (!trimmed) return "";
+    const isPercentText = trimmed.endsWith("%");
+    const n = parseFloat(trimmed);
+    if (isNaN(n)) return "";
+    if (isPercentText) return n / 100;
+    return n > 1 ? n / 100 : n;
+  }
+  if (typeof v === "number") {
+    return v > 1 ? v / 100 : v;
+  }
+  return "";
+}
+
+// Match imported condition text against the exact strings calc() checks
+// with strict equality — trims stray whitespace ("Excluding " → "Excluding")
+// and is case-insensitive, so a real-world sloppy export still calculates.
+function normalizeCondition(v) {
+  const s = (v ?? "").toString().trim();
+  if (!s) return "N/A";
+  const found = CONDITIONS.find((c) => c.trim().toLowerCase() === s.toLowerCase());
+  return found || s;
+}
+
+// Header text → field name. Matched case-insensitively with whitespace
+// collapsed, so "Payment Type ", "payment  type", etc. all match.
+const FIELD_HEADER_ALIASES = {
+  date: ["date"],
+  cheque: ["cheque", "cheque no", "cheque no.", "cheque number"],
+  chequeDate: ["cheque date"],
+  vendor: ["name of vendor", "vendor", "vendor name"],
+  paymentType: ["payment type"],
+  particular: ["particular", "particulars"],
+  vendorAddress: ["vendor address"],
+  tin: ["tin"],
+  bin: ["bin"],
+  mainGL: ["main gl"],
+  subGL: ["sub-gl", "sub gl"],
+  sectionRef: ["section ref"],
+  invoiceAmount: ["invoice amount", "invoice"],
+  condition: ["tds vds condition", "tds/vds condition", "condition"],
+  tdsRate: ["tds rate"],
+  vdsRate: ["vds rate"],
+  remarks: ["remarks", "remarks 1"],
+};
+function normHeader(s) {
+  return (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+}
+// Scans the first few rows for the one that looks most like a header row
+// (matches the most known field names) — handles the real Work sheet's
+// two-row header (a title row, then the real headers) without hardcoding
+// "row 2".
+function detectHeaderMap(rows) {
+  let best = { rowIndex: -1, score: 0, map: {} };
+  const scanRows = Math.min(rows.length, 6);
+  for (let r = 0; r < scanRows; r++) {
+    const row = rows[r] || [];
+    const map = {};
+    let score = 0;
+    row.forEach((cell, c) => {
+      const h = normHeader(cell);
+      if (!h) return;
+      for (const [field, aliases] of Object.entries(FIELD_HEADER_ALIASES)) {
+        if (map[field] !== undefined) continue; // first matching column wins
+        if (aliases.includes(h)) {
+          map[field] = c;
+          score++;
+          break;
+        }
+      }
+    });
+    if (score > best.score) best = { rowIndex: r, score, map };
+  }
+  // Require several confident matches before trusting header-based mapping;
+  // otherwise fall back to the known positional layout.
+  return best.score >= 4 ? best : null;
+}
+
 async function parseExcelFile(file, existingRecords) {
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: "array", cellDates: true });
@@ -186,33 +283,47 @@ async function parseExcelFile(file, existingRecords) {
   const ws = wb.Sheets[sheetName];
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
 
+  // Positional fallback — the original Work sheet's exact column order.
+  const fallbackMap = {
+    date: 1, cheque: 2, chequeDate: 3, vendor: 4, paymentType: 5, particular: 6,
+    vendorAddress: 7, tin: 8, bin: 9, mainGL: 10, subGL: 11, sectionRef: 12,
+    invoiceAmount: 13, condition: 14, tdsRate: 15, vdsRate: 16, remarks: 29,
+  };
+  const detected = detectHeaderMap(rows);
+  const colMap = detected ? { ...fallbackMap, ...detected.map } : fallbackMap;
+  const dataStart = detected ? detected.rowIndex + 1 : 0;
+  const cell = (row, field) => {
+    const idx = colMap[field];
+    return idx === undefined ? "" : row[idx];
+  };
+
   let sl = existingRecords.reduce((m, r) => Math.max(m, r.sl || 0), 0);
   const out = [];
-  rows.forEach((row, i) => {
-    const vendor = (row[4] || "").toString().trim();
-    const invoice = parseFloat(row[13]);
+  rows.slice(dataStart).forEach((row, i) => {
+    const vendor = (cell(row, "vendor") || "").toString().trim();
+    const invoice = parseFloat(cell(row, "invoiceAmount"));
     if (!vendor || !invoice) return; // skip header/blank/total rows
     sl += 1;
     out.push({
       id: `imp-${Date.now()}-${i}`,
       sl,
-      date: excelDateToStr(row[1]),
-      cheque: (row[2] || "").toString(),
-      chequeDate: excelDateToStr(row[3]),
+      date: excelDateToStr(cell(row, "date")),
+      cheque: (cell(row, "cheque") || "").toString(),
+      chequeDate: excelDateToStr(cell(row, "chequeDate")),
       vendor,
-      paymentType: (row[5] || "Payment").toString().trim() || "Payment",
-      particular: (row[6] || "").toString(),
-      vendorAddress: (row[7] || "").toString(),
-      tin: (row[8] || "").toString(),
-      bin: (row[9] || "").toString(),
-      mainGL: (row[10] || "").toString(),
-      subGL: (row[11] || "").toString(),
-      sectionRef: (row[12] || "").toString(),
+      paymentType: (cell(row, "paymentType") || "Payment").toString().trim() || "Payment",
+      particular: (cell(row, "particular") || "").toString(),
+      vendorAddress: (cell(row, "vendorAddress") || "").toString(),
+      tin: (cell(row, "tin") || "").toString(),
+      bin: (cell(row, "bin") || "").toString(),
+      mainGL: (cell(row, "mainGL") || "").toString(),
+      subGL: (cell(row, "subGL") || "").toString(),
+      sectionRef: (cell(row, "sectionRef") || "").toString(),
       invoiceAmount: invoice,
-      condition: (row[14] || "N/A").toString().trim() || "N/A",
-      tdsRate: row[15] === "" || row[15] == null ? "" : parseFloat(row[15]),
-      vdsRate: row[16] === "" || row[16] == null ? "" : parseFloat(row[16]),
-      remarks: (row[29] || "").toString(),
+      condition: normalizeCondition(cell(row, "condition")),
+      tdsRate: normalizeRate(cell(row, "tdsRate")),
+      vdsRate: normalizeRate(cell(row, "vdsRate")),
+      remarks: (cell(row, "remarks") || "").toString(),
     });
   });
   return out;
@@ -1724,10 +1835,34 @@ function Transactions({ records, onEdit, onDelete, onImport }) {
    DASHBOARD
 --------------------------------------------------------------------- */
 function Dashboard({ records }) {
-  const rows = useMemo(
+  const allRows = useMemo(
     () => records.map((r) => ({ ...r, ...calc(r) })),
     [records],
   );
+
+  const years = useMemo(() => {
+    const s = new Set();
+    allRows.forEach((r) => {
+      const d = new Date(r.date);
+      if (!isNaN(d)) s.add(d.getFullYear());
+    });
+    return Array.from(s).sort((a, b) => b - a);
+  }, [allRows]);
+
+  const [year, setYear] = useState("All");
+  const [month, setMonth] = useState("All");
+
+  const rows = useMemo(() => {
+    if (year === "All" && month === "All") return allRows;
+    return allRows.filter((r) => {
+      const d = new Date(r.date);
+      if (isNaN(d)) return false; // undated rows only show under All/All
+      if (year !== "All" && d.getFullYear() !== Number(year)) return false;
+      if (month !== "All" && d.getMonth() !== Number(month)) return false;
+      return true;
+    });
+  }, [allRows, year, month]);
+
   const totals = rows.reduce(
     (a, r) => ({
       invoice: a.invoice + r.invoiceAmount,
@@ -1770,6 +1905,52 @@ function Dashboard({ records }) {
   return (
     <div>
       <div
+        className="no-print"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          marginBottom: 16,
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{
+            fontFamily: "'IBM Plex Sans'",
+            fontSize: 12.5,
+            fontWeight: 600,
+            color: T.inkSoft,
+          }}
+        >
+          Period
+        </span>
+        <TSelect value={year} onChange={(e) => setYear(e.target.value)} style={{ maxWidth: 130 }}>
+          <option value="All">All Years</option>
+          {years.map((y) => (
+            <option key={y} value={y}>{y}</option>
+          ))}
+        </TSelect>
+        <TSelect value={month} onChange={(e) => setMonth(e.target.value)} style={{ maxWidth: 160 }}>
+          <option value="All">All Months</option>
+          {MONTH_NAMES.map((m, i) => (
+            <option key={m} value={i}>{m}</option>
+          ))}
+        </TSelect>
+        {(year !== "All" || month !== "All") && (
+          <button
+            onClick={() => { setYear("All"); setMonth("All"); }}
+            style={{
+              padding: "8px 14px", borderRadius: 20, border: `1px solid ${T.line}`,
+              background: T.card, color: T.inkSoft, fontFamily: "'IBM Plex Sans'",
+              fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            Clear filter
+          </button>
+        )}
+      </div>
+
+      <div
         style={{
           display: "grid",
           gridTemplateColumns: "repeat(4, 1fr)",
@@ -1781,7 +1962,7 @@ function Dashboard({ records }) {
           icon={Receipt}
           label="Total Invoice Amount"
           value={`৳ ${money(totals.invoice)}`}
-          sub={`${records.length} transactions`}
+          sub={`${rows.length} transactions`}
         />
         <StatCard
           icon={Landmark}
@@ -1799,10 +1980,10 @@ function Dashboard({ records }) {
         />
         <StatCard
           icon={Wallet}
-          label="Total Net Payment"
+          label="Total Payment"
           value={`৳ ${money(totals.net)}`}
           accent={T.accent}
-          sub="Disbursed to vendors"
+          sub="Net disbursed to vendors"
         />
       </div>
 
@@ -2324,9 +2505,162 @@ function Reports({ records }) {
 }
 
 /* ---------------------------------------------------------------------
-   APP SHELL
+   WELCOME PAGE — UI only, first screen shown on open
 --------------------------------------------------------------------- */
-export default function App() {
+function WelcomePage({ onContinue }) {
+  return (
+    <div style={{
+      minHeight: "100vh", width: "100%", display: "flex", alignItems: "stretch",
+      background: T.paper, fontFamily: "'IBM Plex Sans', sans-serif",
+    }}>
+      <div style={{
+        flex: "0 0 42%", minWidth: 320, background: T.ink, display: "flex",
+        flexDirection: "column", justifyContent: "center", padding: "60px 56px",
+        position: "relative", overflow: "hidden",
+      }}>
+        <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 4, background: T.rule }} />
+        <div style={{
+          width: 52, height: 52, borderRadius: 10, background: T.rule, display: "flex",
+          alignItems: "center", justifyContent: "center", fontFamily: "'Source Serif 4'",
+          color: "#fff", fontWeight: 700, fontSize: 26, marginBottom: 28,
+        }}>H</div>
+        <div style={{ fontFamily: "'IBM Plex Sans'", fontSize: 12, fontWeight: 600, letterSpacing: ".08em", textTransform: "uppercase", color: "#8FA39D", marginBottom: 10 }}>
+          Hastizam Limited
+        </div>
+        <h1 style={{ fontFamily: "'Source Serif 4'", fontSize: 40, lineHeight: 1.15, color: "#fff", margin: "0 0 18px" }}>
+          Hastizam Ledger
+        </h1>
+        <p style={{ fontFamily: "'IBM Plex Sans'", fontSize: 14.5, lineHeight: 1.7, color: "#B7C6C2", maxWidth: 400, margin: 0 }}>
+          A single home for TDS, VDS, and vendor payment records — master data entry,
+          live withholding calculations, filterable transactions, and reports, all
+          in one place.
+        </p>
+        <div style={{ display: "flex", gap: 22, marginTop: 40 }}>
+          {["TDS", "VDS", "Payments"].map((t) => (
+            <div key={t} style={{ fontFamily: "'IBM Plex Mono'", fontSize: 11.5, color: "#8FA39D", letterSpacing: ".05em", borderTop: "1px solid rgba(255,255,255,.15)", paddingTop: 8 }}>
+              {t}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 40 }}>
+        <div style={{ maxWidth: 380, textAlign: "left" }}>
+          <div style={{ fontFamily: "'IBM Plex Sans'", fontSize: 11.5, fontWeight: 600, letterSpacing: ".05em", textTransform: "uppercase", color: T.rule, marginBottom: 10 }}>
+            Welcome
+          </div>
+          <h2 style={{ fontFamily: "'Source Serif 4'", fontSize: 28, color: T.ink, margin: "0 0 14px" }}>
+            Your accounting ledger, ready when you are
+          </h2>
+          <p style={{ fontFamily: "'IBM Plex Sans'", fontSize: 14, lineHeight: 1.7, color: T.inkSoft, margin: "0 0 30px" }}>
+            Enter transactions, import your Excel workbook, and review dashboards
+            and reports — all recalculated automatically as you work.
+          </p>
+          <button onClick={onContinue} style={{
+            display: "inline-flex", alignItems: "center", gap: 10, padding: "13px 28px",
+            borderRadius: 8, border: "none", background: T.accent, color: "#fff",
+            fontFamily: "'IBM Plex Sans'", fontSize: 14.5, fontWeight: 600, cursor: "pointer",
+          }}>
+            Get Started <ArrowRight size={16} />
+          </button>
+          <div style={{ fontFamily: "'IBM Plex Sans'", fontSize: 11.5, color: T.muted, marginTop: 18 }}>
+            Hastizam Ledger · TDS / VDS accounting prototype
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------
+   LOGIN PAGE — UI only, no real authentication yet
+--------------------------------------------------------------------- */
+function LoginPage({ onLogin, onBack }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(true);
+
+  function submit(e) {
+    e.preventDefault();
+    onLogin(); // UI only — no real authentication yet
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh", width: "100%", display: "flex", alignItems: "center",
+      justifyContent: "center", background: T.paper, fontFamily: "'IBM Plex Sans', sans-serif",
+      padding: 24,
+    }}>
+      <form onSubmit={submit} style={{
+        width: "100%", maxWidth: 380, background: T.card, border: `1px solid ${T.line}`,
+        borderRadius: 14, padding: "38px 34px", position: "relative", overflow: "hidden",
+      }}>
+        <div style={{ position: "absolute", left: 0, top: 0, right: 0, height: 3, background: T.rule }} />
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 26 }}>
+          <div style={{
+            width: 34, height: 34, borderRadius: 8, background: T.ink, display: "flex",
+            alignItems: "center", justifyContent: "center", fontFamily: "'Source Serif 4'",
+            color: "#fff", fontWeight: 700, fontSize: 17,
+          }}>H</div>
+          <div>
+            <div style={{ fontFamily: "'Source Serif 4'", fontSize: 16, fontWeight: 600, color: T.ink, lineHeight: 1.1 }}>Hastizam Ledger</div>
+            <div style={{ fontFamily: "'IBM Plex Sans'", fontSize: 10.5, color: T.muted }}>Sign in to continue</div>
+          </div>
+        </div>
+
+        <Field label="Username or Email">
+          <TInput type="text" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@hastizam.com" autoComplete="username" />
+        </Field>
+        <div style={{ height: 14 }} />
+        <Field label="Password">
+          <TInput type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" />
+        </Field>
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "16px 0 22px" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: "'IBM Plex Sans'", fontSize: 12.5, color: T.inkSoft, cursor: "pointer" }}>
+            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} style={{ accentColor: T.accent, width: 14, height: 14 }} />
+            Remember me
+          </label>
+          <a href="#" onClick={(e) => e.preventDefault()} style={{ fontFamily: "'IBM Plex Sans'", fontSize: 12.5, color: T.rule, textDecoration: "none", fontWeight: 600 }}>
+            Forgot password?
+          </a>
+        </div>
+
+        <button type="submit" style={{
+          width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
+          background: T.accent, color: "#fff", fontFamily: "'IBM Plex Sans'",
+          fontSize: 14.5, fontWeight: 600, cursor: "pointer", display: "flex",
+          alignItems: "center", justifyContent: "center", gap: 8,
+        }}>
+          <LogIn size={16} /> Login
+        </button>
+
+        <div style={{ textAlign: "center", marginTop: 18 }}>
+          <button type="button" onClick={onBack} style={{
+            background: "none", border: "none", cursor: "pointer",
+            fontFamily: "'IBM Plex Sans'", fontSize: 12, color: T.muted,
+          }}>
+            ← Back
+          </button>
+        </div>
+
+        <div style={{
+          marginTop: 18, paddingTop: 16, borderTop: `1px dashed ${T.line}`,
+          fontFamily: "'IBM Plex Sans'", fontSize: 10.5, color: T.muted, textAlign: "center", lineHeight: 1.5,
+        }}>
+          UI preview only — any credentials continue into the ledger. Real authentication isn't wired up yet.
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------
+   APP SHELL (the existing dashboard/entry/transactions/reports app —
+   unchanged, just renamed so it can be mounted after Welcome → Login)
+--------------------------------------------------------------------- */
+function LedgerApp() {
   const [tab, setTab] = useState("dashboard");
   const [records, setRecords] = useState(null); // null = loading
   const [editing, setEditing] = useState(null);
@@ -2656,6 +2990,47 @@ export default function App() {
             />
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------
+   TOP-LEVEL APP — drives Welcome → Login → Ledger with a fade/slide
+   transition between stages. UI flow only; login does not authenticate.
+--------------------------------------------------------------------- */
+const STAGE_TRANSITION_CSS = `
+@keyframes stageFadeIn {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes stageFadeOut {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(-10px); }
+}
+.stage-enter { animation: stageFadeIn 420ms ease both; }
+.stage-leave { animation: stageFadeOut 260ms ease both; }
+`;
+
+export default function App() {
+  const [stage, setStage] = useState("welcome"); // welcome | login | app
+  const [leaving, setLeaving] = useState(false);
+
+  function goTo(next) {
+    setLeaving(true);
+    setTimeout(() => {
+      setStage(next);
+      setLeaving(false);
+    }, 260);
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", width: "100%" }}>
+      <style>{FONT_CSS}{STAGE_TRANSITION_CSS}</style>
+      <div key={stage} className={leaving ? "stage-leave" : "stage-enter"}>
+        {stage === "welcome" && <WelcomePage onContinue={() => goTo("login")} />}
+        {stage === "login" && <LoginPage onLogin={() => goTo("app")} onBack={() => goTo("welcome")} />}
+        {stage === "app" && <LedgerApp />}
       </div>
     </div>
   );
